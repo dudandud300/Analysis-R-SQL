@@ -1,0 +1,2746 @@
+# Лабораторная работа 12
+
+> Это версия исходника для чтения на GitHub: код и авторские пояснения, без вычисленного вывода. Для исполнения используйте [analysis.Rmd](analysis.Rmd).
+
+
+```r
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center",
+  out.width = "90%"
+)
+
+options(
+  scipen = 999,
+  digits = 3,
+  width = 200,                    
+  tibble.width = Inf,            
+  tibble.print_max = Inf          
+)
+
+```
+
+
+**Задание 1**
+
+Загрузим пакеты и установим фиксированный сид для воспроизводимости.
+
+```r
+# базовые манипуляции
+library(tidyverse)   
+library(lubridate)   
+
+# факторный анализ и кластеризация
+library(FactoMineR)  
+library(factoextra)  
+library(cluster)     
+
+# машинное обучение
+library(randomForest) 
+library(xgboost)     
+library(lightgbm)     
+library(shapviz)      
+
+# метрики и валидация
+library(caret)        
+library(pROC)         
+library(car)          
+
+library(knitr)
+
+# градбуст
+library(rpart)
+library(rpart.plot)
+library(catboost)
+
+set.seed(857612)
+
+```
+
+Создадим переменную нашего датасета и сразу возьмем выборку
+
+```r
+
+bmq_file <- read_csv(
+  "../../data/lab-12/bank_marketing.csv",
+  show_col_types = FALSE
+)
+
+bmq_sample1 <- bmq_file %>%
+  slice_sample(n = 11111)
+
+# помимо малой выборки сразу берем и большую подвыборку -
+# так проверим все анализы
+bmq_sample2 <- bmq_file %>%
+  slice_sample(n = 22222)
+
+```
+
+Смотрим струкутру переменных через glimpse()
+
+```r
+
+glimpse(bmq_sample1)
+
+```
+
+После анализа приложения создадим векторы переменных, чтобы можно было выводить диаграммы распределения через цикл (фасеточное отображение будет достаточно маленьким). При этом в датасете есть парочка переменных, которые будет необходимо преобразовать - pdays и customer_rating. В pdays как 999 закодировано отсутствие прошлого контакта. Customer_rating - является частично упорядоченной, потому что в кодировке имеется значение 0 - отсутствие оценки. Поэтому, чтобы отделить мухи от котлет создадим по дополнительной переменной, показывающей наличие контакта Was_pdays и наличие оставленного рейтинга was_customer_rating. 
+ 
+
+```r
+# поскольку в нашем случае мы оперируем с двумя выборками сразу
+# целесообразно - перекодировать их через функцию от уже имевшейся перекодировки
+recode_bmq <- function(df) {
+  df %>%
+    mutate(
+      was_pdays = if_else(is.na(pdays) | pdays == 999, 0, 1),
+      pdays = if_else(pdays == 999, NA_real_, pdays),
+
+      was_customer_rating = if_else(is.na(customer_rating) | customer_rating == 0, 0, 1),
+      customer_rating = if_else(customer_rating == 0, NA_real_, customer_rating)
+    )
+}
+
+bmq_sample1 <- recode_bmq(bmq_sample1)
+bmq_sample2 <- recode_bmq(bmq_sample2)
+
+cat_vars <- c(
+  "job",
+  "marital",
+  "education",
+  "default",
+  "housing",
+  "loan",
+  "contact",
+  "month",
+  "day_of_week",
+  "poutcome",
+  "y",
+  "primary_channel",
+  "customer_rating",
+  "has_opted_out",
+  "marketing_channel",
+  "was_pdays",
+  "was_customer_rating"
+)
+
+num_vars <- c(
+  "age",
+  "duration",
+  "campaign",
+  "pdays",
+  "previous",
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "euribor3m",
+  "nr.employed",
+  "involvement_score",
+  "account_tenure",
+  "market_sentiment",
+  "seasonal_promo_index",
+  "account_balance",
+  "campaign_email",
+  "campaign_push"
+)
+
+```
+
+Переведем категориальные переменные в факторный вид две наши выборки
+
+```r
+bmq_sample1 <- bmq_sample1 %>%
+  mutate(
+    across(all_of(cat_vars), as.factor)
+  )
+
+bmq_sample2 <- bmq_sample2 %>%
+  mutate(
+    across(all_of(cat_vars), as.factor)
+  )
+
+glimpse(bmq_sample1)
+```
+
+Теперь посмотрим сводку по перемемнным через summary(). Сначала по категориальным, потом по числовым
+
+```r
+
+bmq_sample1 %>%
+  select(all_of(cat_vars)) %>%
+  skimr::skim()
+
+bmq_sample2 %>%
+  select(all_of(cat_vars)) %>%
+  skimr::skim()
+
+```
+
+Complete-rate не сильно отличается на двух подвыборках - можем смотреть по числовым переменным
+
+```r
+
+bmq_sample1 %>%
+  select(all_of(num_vars)) %>%
+  skimr::skim()
+
+bmq_sample2 %>%
+  select(all_of(num_vars)) %>%
+  skimr::skim()
+
+
+```
+
+Мы вывели сводку - по пропускам ситуация интересная - в преобразованных переменных pdays и customer_rating их доля находится на высоком уровне. У каждого пятого наблюдения нет данных о состоянии дефолта - эти данные могут очень сильно испортить нам жизнь. В остальных доли пропусков находятся в приемлемых пределах. На разных выборках у переменных age, pdays, market_sentiment слегка поменялись распределения - в целом, выглядит совершенно некритично
+
+
+Построим теперь распределения для категориальных переменных.
+
+```r
+
+cat_long1 <- bmq_sample1 %>%
+  select(all_of(cat_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    value = replace_na(value, "NA")
+  ) %>%
+  count(variable, value) %>%
+  group_by(variable) %>%
+  mutate(
+    pct = n / sum(n) * 100
+  ) %>%
+  ungroup()
+
+ggplot(cat_long1, aes(x = reorder(value, pct), y = pct)) +
+  geom_col(
+    fill = "#1a2bc3",
+    alpha = 0.85
+  ) +
+  coord_flip() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Распределения категориальных переменных, smpl1",
+    x = NULL,
+    y = "Доля наблюдений, %"
+  ) +
+  theme_minimal()
+
+```
+
+В y сильный дисбаланс: no намного больше, чем yes. Поэтому результаты в будущих моделях могут быть неточными
+
+Для poutcome - большинство клиентов не имели прошлого результата кампании, прошлое взаимодействие есть только у небольшой части клиентов, поэтому признаки прошлого контакта могут быть сильными, но нестабильными.
+
+В default много пропусков, а категория yes неприлично мала - эта переменная может быть нестабильной для анализа - ее мы будем всячески избегать
+
+В каналах заметно выделяется mobile_app.
+
+Посмотрим на те же категориальные переменные на большей подвыборке
+
+```r
+
+cat_long2 <- bmq_sample2 %>%
+  select(all_of(cat_vars)) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    value = replace_na(value, "NA")
+  ) %>%
+  count(variable, value) %>%
+  group_by(variable) %>%
+  mutate(
+    pct = n / sum(n) * 100
+  ) %>%
+  ungroup()
+
+ggplot(cat_long2, aes(x = reorder(value, pct), y = pct)) +
+  geom_col(
+    fill = "#1a2bc3",
+    alpha = 0.85
+  ) +
+  coord_flip() +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Распределения категориальных переменных, smpl2",
+    x = NULL,
+    y = "Доля наблюдений, %"
+  ) +
+  theme_minimal()
+
+```
+
+Минимальные изменения замечаем в распределении - в job самозанятые стали чуть больше чем предприниматели (их доли были практически равны), а в day_of_week - вторник обгоняет пятницу (ситуация аналогичная). По категориальным переменным, за исключением вышенаписанного, мы не получили никакой дополнительной информации в с связи с увеличением выборки
+
+
+Теперь по переменным со шкалой отношений построим гистограммы
+
+```r
+
+num_long1 <- bmq_sample1 %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(num_long1, aes(x = value)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#1a2bc3",
+    alpha = 0.85,
+  ) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(
+    title = "Гистограммы числовых переменных, smpl1",
+    x = NULL,
+    y = "Частота"
+  ) +
+  theme_minimal()
+
+```
+
+account_balance распределен относительно симметрично, но есть очень правый хвост
+
+Распределение duration резко скошено вправо: большинство контактов короткие, но есть очень длинные.
+Переменная, скорее всего, будет хорошо связана с y, но для будущего скоринга она подозрительная, потому что длительность известна уже после контакта.
+
+Относительно campaign - большинство клиентов получили мало контактов, но есть редкие случаи с очень большим числом касаний.
+Это может означать, что часть клиентов долго “дожимали”, но это не обязательно повышает конверсию.
+
+То же самое посмотрим на увеличенной выборке
+
+
+```r
+
+num_long2 <- bmq_sample2 %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(num_long2, aes(x = value)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#1a2bc3",
+    alpha = 0.85,
+  ) +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(
+    title = "Гистограммы числовых переменных, smpl2",
+    x = NULL,
+    y = "Частота"
+  ) +
+  theme_minimal()
+
+```
+
+После изучения графиков можно сказать следующее - единственное отличие, которое кажется заметным визуально, является изменение возраста. Есть предположение, что большая подвыборка моложе. Но среднее по увиденному в skim не сильно больше. В целом, никаких экстраординарных изменений замечено не было.
+
+Теперь по переменным со шкалой отношений построим boxplot'ы
+
+```r
+
+ggplot(num_long1, aes(x = "", y = value)) +
+  geom_boxplot(
+    fill = "#1a2bc3",
+    alpha = 0.85,
+    outlier.alpha = 0.35
+  ) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Boxplot числовых переменных, smpl1",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+
+```
+
+В account_balance есть верхние выбросы (мы их рассмотрим поподробнее потом)
+
+В duration много сильных верхних выбросов
+
+В счетчиках коммуникаций (campaign, campaign_email, campaign_push, previous) также много верхних выбросов
+
+В age есть пожилые клиенты как верхние выбросы
+
+Продублируем теперь для выборки 2.
+
+```r
+
+ggplot(num_long2, aes(x = "", y = value)) +
+  geom_boxplot(
+    fill = "#1a2bc3",
+    alpha = 0.85,
+    outlier.alpha = 0.35
+  ) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Boxplot числовых переменных, smpl2",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+
+```
+
+Коробки boxplot не сильно изменились визуально. Данные не разваливаются при увеличении подвыборки.
+
+
+Учитывая минимальные различия как по описательной статистике, так и в визуальном отображении - в целях экономии кода поговорим про выбросы в перменной account_balance поговорим на малой выборке
+
+```r
+
+ab_borders <- bmq_sample1 %>%
+  summarise(
+    q1 = quantile(account_balance, 0.25, na.rm = TRUE),
+    q3 = quantile(account_balance, 0.75, na.rm = TRUE)
+  ) %>%
+  mutate(
+    iqr = q3 - q1,
+    lower_border = q1 - 1.5 * iqr,
+    upper_border = q3 + 1.5 * iqr
+  )
+
+ab_borders
+
+ab_outliers <- bmq_sample1 %>%
+  mutate(
+    is_outlier = account_balance < ab_borders$lower_border |
+      account_balance > ab_borders$upper_border
+  )
+
+ab_outliers %>%
+  count(is_outlier) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1)
+  )
+
+```
+
+В данной переменной присутствует крайне малое количество выбросов - всего 38 (0,3% от всех наблюдений), так что в целом, ничего страшного не оказывается.
+
+Теперь все таки продублируем информацию для начальства по балансу целевой переменной y
+
+```r
+
+y_balance1 <- bmq_sample1 %>%
+  count(y) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    sample = "n = 11111"
+  )
+
+y_balance2 <- bmq_sample2 %>%
+  count(y) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    sample = "n = 22222"
+  )
+
+y_balance_both <- bind_rows(y_balance1, y_balance2)
+
+ggplot(y_balance_both, aes(x = y, y = pct, fill = sample)) +
+  geom_col(width = 0.6, alpha = 0.85, position = position_dodge(width = 0.65)) +
+  geom_text(
+    aes(label = paste0(pct, "%")),
+    position = position_dodge(width = 0.65),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_fill_manual(values = c("n = 11111" = "#1a2bc3", "n = 22222" = "#7a86e0")) +
+  labs(
+    title = "Баланс y: smpl1 / smpl2",
+    x = NULL,
+    y = "Доля наблюдений, %",
+    fill = "Подвыборка"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+Еще раз отметим, что мы видим сильный дисбаланс по этой переменной - в дальнейшем нужно будет действовать с ее анализом очень осторожно - равно как и с интерпретацией полученных данных. При этом даже особых визуальных отличий при увеличении подвыборки нет.
+
+
+Теперь посмотрим с помощью ggpairs-визуализации на корреляции и распределения переменных. Нас, конечно в первую очередь интересует, с чем может быть связана y. Отберем, на мой взгляд, самые адекватные переменные для корреляционного анализа
+
+```r
+ggpairs_vars <- c(
+  "y",
+  "duration",
+  "campaign",
+  "previous",
+  "account_balance",
+  "involvement_score",
+  "account_tenure",
+  "market_sentiment"
+)
+
+GGally::ggpairs(
+  bmq_sample1 %>%
+    select(all_of(ggpairs_vars)) %>%
+    mutate(
+      y = as.factor(y)
+    )
+)
+
+
+GGally::ggpairs(
+  bmq_sample2 %>%
+    select(all_of(ggpairs_vars)) %>%
+    mutate(
+      y = as.factor(y)
+    )
+)
+```
+
+На gg-pairs для разных подвыборок мы можем обнаружить две новые связи для previous - с account_tenure и duration, однако связь едва уловима. Таким образом, мы можем сказать, что профиль устойчив. Мы можем приступать к построению гипотез и дальнейшему анализу.
+
+
+
+Теперь можем построить некоторые гипотезы.
+
+1. Клиенты с успешным прошлым контактом чаще склонны к y = yes
+2. Чем дольше контакт с клиентом, тем выше вероятность y = yes, но duration может давать утечку для будущего прогноза.
+3. Слишком большое число контактов не обязательно повышает отклик и может указывать на менее склонных к конверсии клиентов.
+4. CRM-признаки и каналы коммуникации могут объяснять отклик лучше, чем базовые социально-демографические признаки.
+
+И ответ на вопрос для отчета:
+
+Поскольку анализ проводится на подвыборке, полученный профиль клиентов нельзя считать абсолютно точным отражением всей базы. Подвыборка может исказить долю редких категорий, баланс y, число выбросов и распределение признаков с большим количеством пропусков.
+
+На текущих данных RFM-логика раскладывается так: Recency - это pdays (дней с прошлого контакта) и отчасти previous, Frequency - счетчики campaign, campaign_email, campaign_push и previous, Monetary - account_balance как попытка определения денежной ценности клиента.
+
+Важно также сказать про пропуски - они не всегда являются случайной ошибкой. Основной удар пропусков приходится на Recency: pdays = 999 означает не «давно», а «контакта не было» (это неслучайный пропуск, совпадающий с poutcome = nonexistent). Импутация средним приписала бы клиенту несуществующую историю и фактически бы фальсифицировала Recency, поэтому я не импутирую, а сохраняю различие через индикатор was_pdays. Frequency искажается мягче - только засчет верхних выбросов; Monetary почти не страдает.
+
+**ЗАДАНИЕ 2** 
+
+Итак, начнем строить MCA. Для построения отберем 9 категориальных переменных. 
+
+
+
+```r
+
+cat_vars_mca <- c(
+  "marital",
+  "education",
+  "housing",
+  "loan",
+  "contact",
+  "poutcome",
+  "marketing_channel",
+  "has_opted_out",
+  "y"
+)
+
+
+
+mca_data <- bmq_sample1 %>%
+  select(all_of(cat_vars_mca)) %>%
+  drop_na() %>%
+  mutate(across(everything(), as.factor)) %>%
+  droplevels()
+
+
+for(var in cat_vars_mca) {
+  cat("\n", var, ":\n")
+  print(
+    table(mca_data[[var]], useNA = "ifany") %>%
+      prop.table() %>%
+      round(3) %>%
+      sort(decreasing = TRUE)
+  )
+}
+
+```
+Мы еще раз взглянем на распределения после очистки пропусков (суммарно осталось 10343 наблюдения - что в целом ок). После многочисленных прогонов я удалил переменную профессионального статуса и месяца, поскольку в них присутствовало достаточно большое количество категорий с низкой предстваленностью. Переменную месяца я удалил без раздумий, а для профессионального статуса сильно колебался. В итоге решил, что для профессионального статуса более грубой оценкой будет выступать уровень образования (хотя все таки внутри переменной тянуть вниз будет переменная illiterate). Возможно также вниз будут тянуть переменные poutcome и marketing_channel, но они слишком важны. 
+
+Строим наш анализ соответствйи и визуализируем наш скриплот
+
+```r
+
+mca_res <- MCA(
+  mca_data,
+  graph = FALSE,
+  ncp = 5
+)
+
+summary(mca_res)
+
+
+fviz_screeplot(
+  mca_res,
+  addlabels = TRUE,
+  title = "MCA: объясненная инерция по осям, smpl1"
+)
+
+```
+Видим много по summary. Первые 5 осей объясняют 32.4  % инерции: Dim.1 = 9.7%, Dim.2 = 6.3%, Dim.3 = 5.8%. Среди категорий первая ось сильнее связана с contact/marketing_channel, ось два - с poutcome и y, ось три - с marital/education. По eta2 эти блоки и формируют главные различия. Посмотрим более подробнее в дальнейшем.
+
+
+Теперь переходим для биплота. Отобразим там все наблюдения
+
+```r
+
+fviz_mca_biplot(
+  mca_res,
+  repel = TRUE,
+  col.var = "contrib",
+  title = "MCA: категории с наибольшим вкладом, smpl1"
+)
+
+```
+
+Видны два больших скопления наблюдений - слева по оси x, равномерно уходящие вверх и вниз по оси y; справа снизу по оси x, находящиеся почти в центре системы координат.
+Заметно также одно небольшое скопление наблюдений вверху справа.
+
+Сами категории не видны, поэтому рассмотрим их подробнее на графике ниже - там мы построим эллипсы доверия для категории y, а также более четко посмотрим на расположение остальных категорий на графике.
+
+```r
+
+y_group <- as.factor(mca_data$y)
+
+fviz_mca_biplot(
+  mca_res,
+  axes = c(1, 2),
+  habillage = y_group,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  label = "var",              # показываем только категории
+  geom.ind = "point",
+  pointsize = 0.6,
+  alpha.ind = 0.18,
+  repel = TRUE,
+  col.var = "black",
+  title = "MCA: категории и эллипсы доверия по y, smpl1",
+  ggtheme = theme_minimal()
+) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Заметно что эллипсы yes и no заметно пересекаются, а значит MCA не дает жесткого разделения клиентов по отклику.
+
+При этом группа yes смещена вправо и вверх. Она ближе к зонам, где находятся y_yes и success (хотя до них также очень далеко). Это говорит о том, что положительный отклик связан прежде всего с результатом прошлой кампании и частью каналов коммуникации.
+
+Группа no сильнее расположена левее и ниже, ближе к telephone, phone, branch, direct_mail, nonexistent, email, failure. Это похоже на менее цифровой и менее результативный профиль коммуникации.
+
+```r
+
+coord <- mca_res$var$coord
+contrib <- mca_res$var$contrib
+cos2 <- mca_res$var$cos2
+
+mca_table <- tibble(
+  category = rownames(coord),
+  dim1 = coord[, 1],
+  dim2 = coord[, 2],
+  contrib_dim1 = contrib[, 1],
+  contrib_dim2 = contrib[, 2],
+  cos2_dim1 = cos2[, 1],
+  cos2_dim2 = cos2[, 2],
+  cos2_12 = cos2[, 1] + cos2[, 2]
+)
+
+mca_table
+
+```
+
+Выведем теперь топы по первой оси
+```r
+
+top5_dim1 <- mca_table %>%
+  arrange(desc(contrib_dim1)) %>%
+  select(category, dim1, dim2, contrib_dim1, cos2_dim1, cos2_12) %>%
+  head(5)
+
+top5_dim1
+
+```
+Ось 1 в основном формируется контактными и канальными различиями. Слева находятся telephone, phone, branch, справа cellular и mobile_app. Значит, Ось можно читать как градиент от традиционного/офлайн контакта к более мобильному и цифровому контакту.
+
+Выведем теперь топы по второй оси
+```r
+
+top5_dim2 <- mca_table %>%
+  arrange(desc(contrib_dim2)) %>%
+  select(category, dim1, dim2, contrib_dim2, cos2_dim2, cos2_12) %>%
+  head(5)
+
+top5_dim2
+
+```
+Ось 2 сильнее всего связана с результатом кампании. Вверху находятся success и y_yes, ниже failure, email, y_no. Можно сказать, что она отражает градиент успешности взаимодействия и склонности к отклику
+
+Теперь рассмотрим самые стабильные категории, выделенные по cos2
+
+```r
+
+high_cos2 <- mca_table %>%
+  filter(cos2_12 > 0.3) %>%
+  arrange(desc(cos2_12)) %>%
+  select(category, dim1, dim2, cos2_dim1, cos2_dim2, cos2_12)
+
+high_cos2
+
+```
+Хорошо представлены только 5 категорий: telephone, cellular, success, y_yes, y_no. Это значит, что именно их можно надежно интерпретировать на плоскости Dim.1-Dim.2. Остальные категории хуже объясняются первыми двумя осями.
+
+
+Теперь построим биплот по самым надежным категориям
+```r
+
+fviz_mca_biplot(
+  mca_res,
+  axes = c(1, 2),
+  repel = TRUE,
+  select.var = list(cos2 = 0.3),
+  col.var = "cos2",
+  gradient.cols = c("#3498DB", "#9B59B6", "#E74C3C"),
+  invisible = "ind",
+  title = "MCA: би-плот категорий с cos2 > 0.3, smpl1",,
+  ggtheme = theme_minimal()
+) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+telephone и cellular противопоставлены по Dim.1. Это подтверждает, что первая ось связана с типом контакта.
+success и y_yes расположены в одной верхне-правой зоне. Это показывает связь успешного прошлого контакта с положительным откликом.
+
+
+Теперь нам стоит перепроверить результаты на большей подвыборке - будем использовать тот же набор переменных.
+
+
+```r
+
+mca_data_big <- bmq_sample2 %>%
+  select(all_of(cat_vars_mca)) %>%
+  drop_na() %>%
+  mutate(across(everything(), as.factor)) %>%
+  droplevels()
+
+dim(mca_data_big)
+
+```
+Доля пропусков на бОльшей выборке сопоставима с долей пропусков на меньшей. Очищенные данные сопоставимы по объему
+
+Построим MCA на второй выборке
+
+```r
+
+mca_res_big <- MCA(
+  mca_data_big,
+  graph = FALSE,
+  ncp = 5
+)
+
+summary(mca_res_big)
+
+
+fviz_screeplot(
+  mca_res_big,
+  addlabels = TRUE,
+  title = "MCA: объясненная инерция по осям, smpl2"
+)
+
+```
+
+Мы видим, что результаты по связи переменных с осями и долей объясненной дисперсии по осям сопоставимы и устойчивы - 5 осей объясняют 32,3% дисперсии, при этом первая ось также сильнее связана с contact/marketing_channel, ось два - с poutcome и y, ось три - с marital/education. Все в порядке с воспроизводимостью.
+
+Посмотрим на доверительные интервалы для большей подвыборки
+
+```r
+
+y_group2 <- as.factor(mca_data_big$y)
+
+fviz_mca_biplot(
+  mca_res_big,
+  axes = c(1, 2),
+  habillage = y_group2,
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  label = "var",            
+  geom.ind = "point",
+  pointsize = 0.6,
+  alpha.ind = 0.18,
+  repel = TRUE,
+  col.var = "black",
+  title = "MCA: категории и эллипсы доверия по y, smpl2",
+  ggtheme = theme_minimal()
+) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Для данного доверительного интервала мы не видим ничего необычного - единственное, категория illiterate из второй координатной четверти перешла в первую. В остальном - все то же самое.
+
+Для окончательной проверки устойчивости необходимо посмотреть на топ категорий и тем более на категории с cos>0.3. Займемся этим
+Сначала соберем таблицу категорий для большой подвыборки
+
+```r
+
+coord_big <- mca_res_big$var$coord
+contrib_big <- mca_res_big$var$contrib
+cos2_big <- mca_res_big$var$cos2
+
+mca_table_big <- tibble(
+  category = rownames(coord_big),
+  dim1 = coord_big[, 1],
+  dim2 = coord_big[, 2],
+  contrib_dim1 = contrib_big[, 1],
+  contrib_dim2 = contrib_big[, 2],
+  cos2_12 = cos2_big[, 1] + cos2_big[, 2]
+)
+
+# топ-5 по вкладу в первую и вторую оси
+top5_dim1_big <- mca_table_big %>%
+  arrange(desc(contrib_dim1)) %>%
+  select(category, dim1, dim2, contrib_dim1, cos2_12) %>%
+  head(5)
+
+top5_dim2_big <- mca_table_big %>%
+  arrange(desc(contrib_dim2)) %>%
+  select(category, dim1, dim2, contrib_dim2, cos2_12) %>%
+  head(5)
+
+top5_dim1_big
+top5_dim2_big
+
+```
+
+Для первой оси сохраняется градиент каналов коммуникации. Для второй - градиент результатов кампании
+
+Смотрим на cos>0.3
+
+```r
+
+mca_table_big %>%
+  filter(cos2_12 > 0.3) %>%
+  arrange(desc(cos2_12)) %>%
+  select(category, dim1, dim2, cos2_12)
+
+fviz_mca_biplot(
+  mca_res_big,
+  axes = c(1, 2),
+  repel = TRUE,
+  select.var = list(cos2 = 0.3),
+  col.var = "cos2",
+  gradient.cols = c("#3498DB", "#9B59B6", "#E74C3C"),
+  invisible = "ind",
+  title = "MCA: би-плот категорий с cos2 > 0.3, smpl2",,
+  ggtheme = theme_minimal()
+) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Значимые категории совпадают, градиенты вырисовываются отчетливо и мы окончательно можем заявить об устойчивости модели. Эти хорошие новости хороши тем, что теперь мы можем приступить к построению гипотез.
+
+Итак:
+1. Клиенты, у которых в прошлой кампании был результат success, чаще склонны к y = yes. Для них можно тестировать повторные персональные предложения, потому что MCA показывает близость success и y_yes.
+
+2. Цифровые каналы коммуникации выглядят перспективнее традиционных. Категории cellular и mobile_app расположены ближе к зоне положительного отклика, тогда как telephone, phone, branch и direct_mail ближе к зоне y = no.
+
+
+И ответим на вопрос для отчета: 
+
+Если категория или переменная плохо представлена на первых осях MCA, ее не стоит активно интерпретировать. Формально это видно через низкие cos2, слабый вклад в оси и незначимый v.test. Такие категории могут присутствовать в данных, но не формировать понятный градиент на карте и каждое новое неоправданное добавление просто будет зашумлять карту и сегментацию таким образом получится сделать заведомо более плохого качества.
+Поэтому для интерпретации лучше опираться на категории с высоким contrib и cos2, а остальные рассматривать как фоновую информацию.
+
+
+**ЗАДАНИЕ 3**
+
+Создадим вектора числовых и категориальных переменных. 
+
+```r
+
+famd_num <- c(
+  "age",
+  "campaign",
+  "previous",
+  "account_balance",
+  "involvement_score",
+  "account_tenure",
+  "campaign_email",
+  "campaign_push"
+)
+
+famd_cat <- c(
+  "marital",
+  "education",
+  "housing",
+  "loan",
+  "contact",
+  "poutcome",
+  "marketing_channel",
+  "has_opted_out",
+  "y"
+)
+
+famd_vars <- c(famd_num, famd_cat)
+
+```
+
+Подготовим наши данные по имеющимся переменным и взглянем на их структуру. В FAMD будут включены числовые и категориальные признаки клиентского профиля, коммуникационной активности и каналов взаимодействия.
+
+```r
+
+famd_data <- bmq_sample1 %>%
+  select(all_of(famd_vars)) %>%
+  drop_na() %>%
+  mutate(
+    across(all_of(famd_num), as.numeric),
+    across(all_of(famd_cat), as.factor)
+  ) %>%
+  droplevels()
+
+glimpse(famd_data)
+
+```
+С данными все в порядке - очистка забрала не более 10%. Можем работать сначала на небольшой подвыборке с FAMD. Скормим ей и числовые и категориальные переменные. Рассмотрим возможности исключения старых и включения новых переменных. Продублируем наш блок с выводом - отобразим саммари и скриплот. 
+
+```r
+
+famd_res <- FAMD(
+  famd_data,
+  ncp = 7,
+  graph = FALSE
+)
+
+summary(famd_res)
+
+```
+И график для удобства
+
+```r
+fviz_screeplot(
+  famd_res,
+  addlabels = TRUE,
+  title = "FAMD: объясненная инерция по компонентам"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+Первые 7 компонент объясняют 41.5% инерции, первые 5 - 33,5% первые 3 - 23.5%. Ось сильнее связана с прошлой коммуникацией и каналами: previous, campaign_push, single и university.degree. Вторая ось в основном отражает возрастно-стажевый профиль: age, account_tenure, single против married/primary. Третья отражает интенсивность коммуникаций: campaign, campaign_email, campaign_push.
+
+Запишем координаты первых наблюдений для первых пяти компонент.
+
+```r
+
+famd_coords_5 <- as.data.frame(famd_res$ind$coord[, 1:5])
+
+# переименовываем координаты без точки, чтобы потом удобно строить графики
+colnames(famd_coords_5) <- paste0("Dim", 1:5)
+
+head(famd_coords_5, 10)
+
+```
+
+Теперь переходим к одной из самых серьезных частей задания - кластеризации.
+
+```r
+
+# берем диапазон от 2 до 8 кластеров
+k_num <- 2:8
+
+
+# для каждого заявленного от 2 до 8 числа кластеров считаем сумму внутрикластерных расстояний
+wss_tbl <- map_dfr(k_num, function(k) {
+  
+  # запускаем k-means на координатах FAMD
+  km <- kmeans(
+    famd_coords_5,
+    centers = k,
+    nstart = 25
+  )
+  
+  # сохраняем в тиббл и K и общую внутрикластерную сумму квадратов
+  tibble(
+    k = k,
+    wss = km$tot.withinss
+  )
+})
+
+wss_tbl
+
+```
+Теперь посмотрим на график, чтобы визуально отобрать число кластеров
+
+```r
+ggplot(wss_tbl, aes(x = k, y = wss)) +
+  geom_line(color = "#1a2bc3", linewidth = 0.8) +
+  geom_point(color = "#1a2bc3", size = 2) +
+  scale_x_continuous(breaks = k_num) +
+  labs(
+    title = "Elbow",
+    x = "Число кластеров",
+    y = "WSS"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+Самый заметный перегиб около K = 3. После этого WSS продолжает снижаться, но уже более плавно. Поэтому по elbow логичный кандидат - 3 кластера (может быть еще 4)
+
+
+Теперь посмотрим на silhouette 
+
+```r
+
+# для каждого K числа кластеров считаем средний силуэт
+sil_kmeans <- map_dfr(k_num, function(k) {
+  
+  # запускаем k-means для текущего числа кластеров
+  km <- kmeans(
+    famd_coords_5,
+    centers = k,
+    nstart = 25
+  )
+  
+  # считаем силуэт по евклидовым расстояниям между FAMD-координатами
+  sil <- silhouette(
+    km$cluster,
+    dist(famd_coords_5)
+  )
+  
+  # сохраняем 
+  tibble(
+    k = k,
+    avg_silhouette = mean(sil[, 3])
+  )
+})
+
+
+sil_kmeans
+
+# и выводим график
+ggplot(sil_kmeans, aes(x = k, y = avg_silhouette)) +
+  geom_line(color = "#1a2bc3", linewidth = 0.8) +
+  geom_point(color = "#1a2bc3", size = 2) +
+  scale_x_continuous(breaks = k_num) +
+  labs(
+    title = "Silhouette",
+    x = "Число кластеров",
+    y = "Средний silhouette"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+Максимум виден при K = 5, но разница с K = 4 не огромная. Учитывая то, что по k-means мы рассматривали вариант с 4-мя кластерами, мы, соответственно, попробуем описать именно 4 кластера
+Фиксируем конечное число кластеров как 4 и мы запускаем k-means на координатах FAMD с K = 4
+
+```r
+k_final <-4
+
+kmeans_final <- kmeans(
+  famd_coords_5,
+  centers = k_final,
+  nstart = 25
+)
+
+table(kmeans_final$cluster)
+
+```
+
+Визуализируем полученные кластеры
+
+```r
+
+fviz_cluster(
+  kmeans_final,
+  data = famd_coords_5,
+  geom = "point",
+  ellipse.type = "norm",
+  palette = "Set2",
+  main = "K-means на координатах FAMD"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+Кластеры выглядят симпатично, однако кластер 3 - самый обширный. Кластер 1 заходит на кластеры 2, 3, 4. Самые компактные кластеры - 3 и 4. 
+Проверяем данные на K-medoids на тех же координатах FAMD - запускаем PAM
+
+```r
+
+pam_final <- pam(
+  famd_coords_5,
+  k = k_final
+)
+
+table(pam_final$clustering)
+
+```
+По числу наблюдений кластеры выглядят более сбалансированными - теперь добавим оба варианта принадлежности к кластерам в FAMD
+
+```r
+
+famd_clustered <- famd_data %>%
+  mutate(
+    cluster_kmeans = as.factor(kmeans_final$cluster),
+    cluster_pam = as.factor(pam_final$clustering)
+  )
+
+head(famd_clustered, 10)
+
+```
+
+Собираем таблицу сравнения двух методов
+
+```r
+
+# считаем silhouette для итогового k-means
+sil_kmeans_final <- silhouette(
+  kmeans_final$cluster,
+  dist(famd_coords_5)
+)
+
+# считаем silhouette для итогового PAM
+sil_pam_final <- silhouette(
+  pam_final$clustering,
+  dist(famd_coords_5)
+)
+
+# число кластеров, силуэт, мин и макс n
+cluster_compare <- tibble(
+  method = c("K-means", "K-medoids"),
+  k = c(k_final, k_final),
+  avg_silhouette = c(
+    mean(sil_kmeans_final[, 3]),
+    mean(sil_pam_final[, 3])
+  ),
+  min_cluster_size = c(
+    min(table(kmeans_final$cluster)),
+    min(table(pam_final$clustering))
+  ),
+  max_cluster_size = c(
+    max(table(kmeans_final$cluster)),
+    max(table(pam_final$clustering))
+  )
+)
+
+cluster_compare
+
+```
+
+Silhouette на малой выборке для K-means = 0.304, PAM = 0.236. Разница в статистическом качестве - почти четверть. 
+При этом иного толка разница наблюдается по размерам кластеров: PAM лучше. У него кластеры заметно более сбалансированы: от 1582 до 2968, у K-means один кластер маленький: 1020, а самый большой 3933
+
+Теперь визуализируем PAM-кластеры на первых двух осях FAMD
+
+```r
+fviz_cluster(
+  pam_final,
+  data = famd_coords_5,
+  geom = "point",
+  ellipse.type = "norm",
+  palette = "Set2",
+  main = "PAM / K-medoids на координатах FAMD"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+Кластеры расположены следующим образом. Для PAM 4 кластер аналог 3 кластера на k-means. Для кластера 1 - кластер 4. Кластеры 2 и 3 выглядят достаточно уникально. Пока
+
+Теперь повторим все наши процедуры на удвоенной выборке в 22222 наблюдений -она уже создана и перекодирована.
+
+```r
+
+famd_data_big <- bmq_sample2 %>%
+  select(all_of(famd_vars)) %>%
+  drop_na() %>%
+  mutate(
+    across(all_of(famd_num), as.numeric),
+    across(all_of(famd_cat), as.factor)
+  ) %>%
+  droplevels()
+
+```
+Запускаем FAMD на большей подвыборке
+
+Потеряно снова не более 10%. 
+
+```r
+
+famd_res_big <- FAMD(
+  famd_data_big,
+  ncp = 7,
+  graph = FALSE
+)
+
+summary(famd_res_big)
+
+```
+Похоже, что пока результат выглядит устойчиво. На малой выборке первые 7 компонент: 41.5% / первые 5 компонент: 33.5%
+На большой выборке стало первые 7 компонент: 41.5% / первые 5 компонент: 33.4%
+
+Ось 1 снова связана с previous и campaign_push, вторая ось снова сильно связан с age и account_tenure, а третья - снова связана с campaign, campaign_email, campaign_push.
+
+Сохраним координаты для наших факторов
+
+```r
+
+famd_coords_big_5 <- as.data.frame(famd_res_big$ind$coord[, 1:5])
+
+# переименовываем координаты без точки, чтобы потом удобно строить графики
+colnames(famd_coords_big_5) <- paste0("Dim", 1:5)
+
+head(famd_coords_big_5, 10)
+
+```
+
+Теперь мы запускаем k-means на большей подвыборке на координатах FAMD с K = 4
+
+```r
+
+k_final <- 4
+
+kmeans_big <- kmeans(
+  famd_coords_big_5,
+  centers = k_final,
+  nstart = 25
+)
+
+table(kmeans_big$cluster)
+```
+Для k-means размеры кластеров уже выглядят вполне себе неплохо - посмотрим, что будет дальше
+
+```r
+
+# запускаем PAM на координатах FAMD большой подвыборки
+pam_big <- pam(
+  famd_coords_big_5,
+  k = k_final
+)
+
+table(pam_big$clustering)
+```
+Мы видим отсутствие различий по наполненности между PAM и k-means. Посмотрим теперь на статистические оценки - на silhouette
+Собираем сходную таблицу сравнения методов на большой подвыборке
+
+```r
+
+# считаем silhouette для k-means на большой подвыборке
+sil_kmeans_big <- silhouette(
+  kmeans_big$cluster,
+  dist(famd_coords_big_5)
+)
+
+# считаем silhouette для PAM на большой подвыборке
+sil_pam_big <- silhouette(
+  pam_big$clustering,
+  dist(famd_coords_big_5)
+)
+
+
+cluster_compare_big <- tibble(
+  sample_n = nrow(famd_data_big),
+  method = c("K-means", "K-medoids"),
+  k = c(k_final, k_final),
+  avg_silhouette = c(
+    mean(sil_kmeans_big[, 3]),
+    mean(sil_pam_big[, 3])
+  ),
+  min_cluster_size = c(
+    min(table(kmeans_big$cluster)),
+    min(table(pam_big$clustering))
+  ),
+  max_cluster_size = c(
+    max(table(kmeans_big$cluster)),
+    max(table(pam_big$clustering))
+  )
+)
+
+
+cluster_compare_big
+
+```
+
+Добавим информацию о размере новой выборки к уже готовой таблице сравнения
+
+```r
+
+cluster_compare_small <- cluster_compare %>%
+  mutate(
+    sample_n = nrow(famd_clustered)
+  ) %>%
+  select(sample_n, everything())
+
+# объединяем сравнение по двум подвыборкам
+cluster_compare_samples <- bind_rows(
+  cluster_compare_small,
+  cluster_compare_big
+)
+
+
+cluster_compare_samples
+
+```
+
+K-medoids оказался зависим от роста n: на малой выборке он проигрывал K-means по силуэту (0.236 против 0.304), но при удвоении наблюдений догнал и чуть превзошел его (0.313 против 0.312), дав при этом более ровные по размеру на малой выборке кластеры. K-means стабилен независимо от n за счет усредненных центроидов. Преимущество медоидов проявляется только на достаточном объеме.
+
+Теперь визуализируем наши кластеры.
+
+Сначала k-means
+
+```r
+
+fviz_cluster(
+  kmeans_big,
+  data = famd_coords_big_5,
+  geom = "point",
+  ellipse.type = "norm",
+  palette = "Set2",
+  main = "K-means на большой подвыборке"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+На кластерах ничего непонятно. 
+
+Построим теперь PAM 
+
+```r
+
+fviz_cluster(
+  pam_big,
+  data = famd_coords_big_5,
+  geom = "point",
+  ellipse.type = "norm",
+  palette = "Set2",
+  main = "PAM / K-medoids на большой подвыборке"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+Выглядит так же не очень - достаточно плохо.
+В силу более устойчивых результатах k-means мы будем использовать кластеры, построенные именно этим методом - при этом будем пользоваться бОльшей выборкой, дабы быть увереннее в своих выводах.
+
+```r
+
+famd_clustered_big <- famd_data_big %>%
+  mutate(
+    cluster_kmeans = as.factor(kmeans_big$cluster)
+  )
+```
+
+Теперь создадим функцию для поиска моды - нужно, чтобы определить самую частую категорию внутри каждого кластера.
+
+```r
+get_mode <- function(x) {
+  x <- na.omit(x)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+```
+
+Теперь построим "числовой" профиль кластера, то есть - по интервальным переменным
+
+```r
+
+cluster_profile_num <- famd_clustered_big %>%
+  group_by(cluster_kmeans) %>%
+  summarise(
+    # размер кластера
+    n = n(),
+    
+    # доля кластера от всей выборки
+    cluster_pct = round(n / nrow(famd_clustered_big) * 100, 1),
+    
+    # доля клиентов с положительным откликом
+    y_yes_pct = round(mean(y == "yes", na.rm = TRUE) * 100, 1),
+    
+    # средние значения числовых признаков внутри кластера
+    across(
+      all_of(famd_num),
+      ~ round(mean(.x, na.rm = TRUE), 2),
+      .names = "mean_{.col}"
+    ),
+    
+    .groups = "drop"
+  )
+
+cluster_profile_num
+
+```
+Получили профиль. Пока его не анализируем - рассмотрим все в конце позже.
+Убираем y из списка категориальных переменных для моды - y уже описан отдельно через y_yes_pct
+
+```r
+
+famd_cat_profile <- setdiff(famd_cat, "y")
+
+```
+
+Строим профиль наших кластеров по категориальным переменным
+
+```r
+
+cluster_profile_cat <- famd_clustered_big %>%
+  group_by(cluster_kmeans) %>%
+  summarise(
+    # для каждой категориальной переменной берем самый частый уровень
+    across(
+      all_of(famd_cat_profile),
+      ~ get_mode(.x),
+      .names = "mode_{.col}"
+    ),
+    
+    .groups = "drop"
+  )
+
+cluster_profile_cat
+
+```
+Также получили профили по категориальным переменным - схлопываем все в одну таблицу и анализируем.
+
+```r
+
+cluster_profile_full <- cluster_profile_num %>%
+  left_join(
+    cluster_profile_cat,
+    by = "cluster_kmeans"
+  )
+
+cluster_profile_full
+
+```
+Кластер 1: Here we go again
+
+Составляет 13.3% выборки - самый маленький кластер. При этом самый высокий отклик y_yes = 25.5%, кратно выше остальных.
+Основной контакт: cellular
+Основной канал: email
+Единственный кластер с реальной историей прошлых контактов: previous = 1.27, и с poutcome = failure (а не nonexistent, как у остальных). Меньше всего текущая нагрузка: campaign = 1.95.
+
+Это САМЫЙ перспективный сегмент. Клиенты уже имели прошлые контакты и заметно лучше откликаются при более умеренной коммуникационной нагрузке. Именно на него стоит направлять основные ресурсы таргетинга.
+
+Кластер 2: Мобильный минимум
+
+Он составляет 32.6% выборки, отклик - y_yes = 11.2%, немного выше среднего.
+
+Основной контакт: cellular
+Основной канал: phone
+Высокий уровень campaign_push = 5.67 - единственный кластер с реальными push-уведомлениями.
+Состоят в браке, закончили университет, ипотеки нет. previous = 0 - прошлых контактов нет.
+
+Фактически, это клиенты с активной push-коммуникацией. Они не самые конверсионные, но выглядят как стабильное ядро для цифровых коммуникаций.
+
+Кластер 3: Цифровое ядро
+
+Составляет 18.5% выборки, отклик - y_yes = 12.3%, чуть выше среднего.
+Основной контакт: cellular
+Основной канал: mobile_app
+previous = 0 - прошлых контактов нет, push почти отсутствует: campaign_push = 0.
+Состоят в браке, закончили университет, имеют ипотеку.
+
+Это мобильный цифровой сегмент с откликом чуть выше фона. Контакт идет через mobile_app, но без истории прошлых взаимодействий - стабильная, но не топовая по конверсии аудитория.
+
+Кластер 4: Очень холодный звонок
+
+Он составляет 35.5% выборки - самый крупный кластер, отклик - y_yes = 4.6%, самый низкий из всех.
+Основной контакт: cellular
+Основной канал: mobile_app
+Нет прошлых контактов: previous = 0
+Push почти нет: campaign_push = 0.02, при этом наибольшая текущая нагрузка: campaign = 2.88.
+
+Это наименее перспективный сегмент. Несмотря на цифровой контакт, история взаимодействий отсутствует, а высокая коммуникационная нагрузка не дает конверсии. Маркетинговому и PR-отделу стоит подумать, как вовлекать этот сегмент, поскольку он самый низкоконверсионный и самый массовый.
+
+Еще раз визуализирую эти кластеры и пропишу саммари. 
+
+```r
+
+fviz_cluster(
+  kmeans_big,
+  data = famd_coords_big_5,
+  geom = "point",
+  ellipse.type = "norm",
+  palette = "Set2",
+  main = "K-means на большой подвыборке"
+) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+K-means на большой подвыборке выделил 4 содержательных сегмента - и основной содержательный вывод то, что разделяющий фактор -previous/poutcome, а не канал. Три кластера без прошлой истории дают отклик 4–12% (среднйи по выборке и ниже), а единственный кластер с прошлыми контактами (previous = 1.27, poutcome = failure) -почти 26%
+
+Теперь займемся анализом структуры полученных кластеров. Для этого посмотрим в таблицах сопряженности на скоректированные стандартные остатки и вертикальные доли.
+
+Сейчас построим ряд однотипных таблиц сопряженности 
+
+```r
+
+# таблица сопряженности: строки - категории contact, столбцы - кластеры k-means
+tab_contact_big <- table(famd_clustered_big$contact, famd_clustered_big$cluster_kmeans)
+# вертикальные доли: структура contact внутри каждого кластера
+round(prop.table(tab_contact_big, margin = 2) * 100, 1)
+# adjusted standardized residuals: значения выше 2.1 - перепредставленность категории в кластере
+round(chisq.test(tab_contact_big)$stdres, 2)
+
+```
+Кластеры 1, 2, 3 почти полностью cellular (asr +35.8 / +57.1 / +38.7). Кластер 4 - резко телефонный (telephone asr +112.8, cellular -112.8).
+
+```r
+
+# poutcome
+tab_poutcome_big <- table(famd_clustered_big$poutcome, famd_clustered_big$cluster_kmeans)
+round(prop.table(tab_poutcome_big, margin = 2) * 100, 1)
+round(chisq.test(tab_poutcome_big)$stdres, 2)
+
+```
+Кластер 1 несет всю прошлую CRM-историю: значимо перепредставлены и failure , и succes, при сильно недопредставленном nonexistent. Кластеры 2, 3, 4 - сегменты без прошлого результата кампании
+
+```r
+
+# marketing_channel
+tab_channel_big <- table(famd_clustered_big$marketing_channel, famd_clustered_big$cluster_kmeans)
+round(prop.table(tab_channel_big, margin = 2) * 100, 1)
+round(chisq.test(tab_channel_big)$stdres, 2)
+
+```
+Кластер 1 - мобильный/email-сегмент. Кластер 2 - мобильный/push . Кластер 3 - email-ядро с примесью телемаркетинга. Кластер 4 - офлайн. Каналы достаточно сильно разводят сегменты.
+
+```r
+
+# y
+tab_y_big <- table(famd_clustered_big$y, famd_clustered_big$cluster_kmeans)
+round(prop.table(tab_y_big, margin = 2) * 100, 1)
+round(chisq.test(tab_y_big)$stdres, 2)
+
+```
+Отклик отличает только крайние кластеры. Кластер 1 - перспективный, yes значимо выше (yes = 25.5%). Кластер 4 - низкоконверсионный (yes = 4.6%)
+
+```r
+
+# education
+tab_education_big <- table(famd_clustered_big$education, famd_clustered_big$cluster_kmeans)
+round(prop.table(tab_education_big, margin = 2) * 100, 1)
+round(chisq.test(tab_education_big)$stdres, 2)
+
+```
+
+Кластер 1 тяготеет к university.degree при недопредставленном primary. Кластер 2 - тоже university.degree. Кластер 3 - сильнее всего university.degree. Кластер 4 - базовое образование: primary + base_secondary, при резко недопредставленном university.degree.
+
+На этом можно подвести промежуточный вывод, уже опираясь на ASR. Сегменты различаются прежде всего по трем осям: каналу коммуникации, наличию прошлой истории взаимодействия и доле положительного отклика. Самым перспективным оказывается кластер 1, наименее перспективен кластер 4. Кластеры 2 и 3 занимают промежуточное положение - это цифровые сегменты без прошлых контактов, по отклику почти не отличающиеся от общего фона.
+
+Теперь проверим предикторы, которые могут повлиять на принадлежность к кластеру - создадим деревья решений. Для этого задания не будем разбивать выборку на train/test, поскольку в первую очередь наши деревья будут использоваться для интерпретации полученных кластеров
+
+
+```r
+
+tree_data_big <- famd_clustered_big %>%
+  mutate(
+    cluster_id = cluster_kmeans
+  ) %>%
+  select(
+    all_of(famd_num),
+    all_of(setdiff(famd_cat, "y")),
+    cluster_id
+  ) %>%
+  na.omit()
+```
+
+Проверяем распределение целевой переменной дерева
+
+```r
+table(tree_data_big$cluster_id)
+```
+Это число наблюдений нашего кластера
+
+Теперь построим decision tree
+
+```r
+
+tree_cluster_big <- rpart(
+  cluster_id ~ .,
+  data = tree_data_big,
+  method = "class",
+  control = rpart.control(
+    minsplit = 50,
+    cp = 0.04,
+    maxdepth = 5
+  )
+)
+
+```
+
+Посмотрим на самые важные переменные для разбиения
+
+```r
+tree_cluster_big$variable.importance
+```
+
+Визуализируем дерево
+
+```r
+
+rpart.plot(
+  tree_cluster_big,
+  type = 4,
+  extra = 101,
+  fallen.leaves = TRUE,
+  main = "Дерево сегментации для K-means, большая выборка",
+  box.palette = "GnBu"
+)
+
+```
+
+В итоге мы видим, что главный признак - marketing_channel: именно он стоит в корне и дает первое разделение. Дальше по важности идут poutcome, contact, previous и campaign_push. 
+
+```r
+rules_big <- rpart.rules(tree_cluster_big)
+
+head(rules_big)
+
+```
+
+По правилам для кластеров ситуация следующая:
+
+Кластер 1 -это клиенты, у которых poutcome = failure или success, то есть была прошлая история кампании, и при этом канал либо mobile_app/push, либо email/telemarketing_v2. В обоих листах вероятность кластера около 100%. Это реактивированный сегмент: разные каналы, но всех объединяет наличие прошлого результата кампании.
+
+Кластер 2 -это клиенты из mobile_app или push с poutcome = nonexistent, то есть мобильный/push-канал без прошлой истории. Вероятность кластера около 99%. Это цифровое push-ядро без прошлых коммуникаций.
+
+Кластер 3 -это клиенты из email или telemarketing_v2 с poutcome = nonexistent. Вероятность кластера около 92%. Это дистанционный email/телемаркетинговый сегмент, тоже без прошлой истории.
+
+Кластер 4 -это клиенты из branch, direct_mail или phone, то есть офлайн-каналы. Вероятность кластера около 89%. Это традиционный офлайн-кластер, самый крупный лист (38% выборки).
+
+В целом дерево показывает, что главный признак для разделения кластеров - это marketing_channel. Для мобильных и push-каналов дополнительно важен previous: без прошлых коммуникаций клиенты чаще попадают в кластер 1, а с прошлой коммуникацией - в кластер 3. 
+
+```r
+```
+
+
+```r
+```
+
+
+```r
+```
+
+Попробуем выполнить деревья на меньшей подвыборке в 11111 наблюдений. Ожидаем некоей устойчивости выводов. Сохраняем настройки идентичными дереву с большой выборкой
+
+```r
+tree_data <- famd_data %>%
+  mutate(
+    cluster_id = as.factor(kmeans_final$cluster)
+  ) %>%
+  select(
+    all_of(famd_num),
+    all_of(setdiff(famd_cat,"y")),
+    cluster_id
+  ) %>%
+  na.omit()
+
+table(tree_data$cluster_id)
+
+tree_cluster <- rpart(
+  cluster_id ~ .,
+  data = tree_data,
+  method = "class",
+  control = rpart.control(
+    minsplit = 50,
+    cp = 0.04,
+    maxdepth = 5
+  )
+)
+
+```
+
+
+```r
+
+tree_cluster$variable.importance
+
+rpart.plot(
+  tree_cluster,
+  type = 4,
+  extra = 101,
+  fallen.leaves = TRUE,
+  main = "Дерево сегментации для K-means, малая выборка",
+  box.palette = "GnBu"
+)
+
+rules <- rpart.rules(tree_cluster)
+
+head(rules)
+```
+
+На малой выборке дерево снова произростает из marketing_channel -устойчивость главного признака подтверждается. Логика первого разбиения идентичная, но внутри mobile_app/push добавляется previous (>= 1 против < 1). Отличие по большому счету именно в этом - здесь нет poutcome, но вообще poutcome и previous - есть признаки истории контактов, поэтому результаты можно назвать сопоставимыми.
+Дерево имеет меньше ответвлений, и номера кластеров другие (но по содержанию сегменты те же). В целом, струкутра сегментации при уменьшении n не разваливается.
+
+
+
+Теперь сравним кластерные центры. 
+
+```r
+kmeans_centers_small_data <- famd_coords_5 %>%
+  mutate(
+    cluster_kmeans = as.factor(kmeans_final$cluster)
+  )
+
+# средние координаты кластеров в пространстве FAMD, малая выборка
+kmeans_centers_small <- kmeans_centers_small_data %>%
+  group_by(cluster_kmeans) %>%
+  summarise(
+    sample_n = nrow(famd_data),
+    n = n(),
+    mean_Dim1 = round(mean(Dim1), 3),
+    mean_Dim2 = round(mean(Dim2), 3),
+    mean_Dim3 = round(mean(Dim3), 3),
+    mean_Dim4 = round(mean(Dim4), 3),
+    mean_Dim5 = round(mean(Dim5), 3),
+    .groups = "drop"
+  )
+kmeans_centers_small
+
+kmeans_centers_big_data <- famd_coords_big_5 %>%
+  mutate(
+    cluster_kmeans = as.factor(kmeans_big$cluster)
+  )
+
+# то же на большой выборке
+kmeans_centers_big <- kmeans_centers_big_data %>%
+  group_by(cluster_kmeans) %>%
+  summarise(
+    sample_n = nrow(famd_data_big),
+    n = n(),
+    mean_Dim1 = round(mean(Dim1), 3),
+    mean_Dim2 = round(mean(Dim2), 3),
+    mean_Dim3 = round(mean(Dim3), 3),
+    mean_Dim4 = round(mean(Dim4), 3),
+    mean_Dim5 = round(mean(Dim5), 3),
+    .groups = "drop"
+  )
+kmeans_centers_big
+
+```
+
+Сведем результаты в одну табличку и проанализируем.
+
+```r
+
+kmeans_centers_compare <- bind_rows(
+  kmeans_centers_small,
+  kmeans_centers_big
+)
+kmeans_centers_compare
+
+```
+
+Вообще, мы видим, что у кластеров не совпадает нумерация. По сходности можно выявить следующую картину, которую опишем как "выборка кластер":
+
+малая 3 (3.015) сходится с большая 1 (2.636) - оба крайние по Оси1. Мы помним, что это технологичный край градиента маркетинговой коммуникации.
+малая 2 (−1.589) сходится с большая 4 (−1.653) -противоположный край Оси 1. Наименее перспективный с точки зрения привлечения.
+малая 4 (Ось 1 0.854, Ось 3 1.289) почти идентичен для большая 2 (Ось 1 0.834, Ось 3 1.285)
+малая №1 (Ось 5 -1.635) есть большая 3  (−1.817) -по Оси 5 отличное совпадение и достаточно близко лежат по всем остальным осям
+
+Таким образом, центры кластеров устойчивы при росте n: положения в пространстве FAMD почти не меняются между выборками. Структура центров сохраняется, а значит - сегментация воспроизводима, а не является артефактом конкретной подвыборки.
+
+Для отчета:
+
+Логика дерева решений в целом совпадает с логикой FAMD. FAMD показал общую структуру различий между клиентами в многомерном пространстве, а дерево перевело эту структуру в простые правила через исходные признаки -что куда практикоприменимее. Наиболее важным признаком стал marketing_channel, и это хорошо согласуется с профилями кластеров, ASR и визуализацией сегментов. Разумеется, дерево не обязано полностью повторять все оси FAMD: оно выбирает только самые сильные и простые разделители. В нашем случае именно marketing_channel настолько хорошо разделяет сегменты, что возраст, баланс, образование и часть коммуникационных признаков почти не нужны для построения правил, а вторым по значимости разделителем выступает история контактов (poutcome / previous), которая и отделяет реактивированный сегмент. В этом смысле важно отметить, что мы опираемся на самый значимый критерий разделения, поэтому не стоит удивляться отсутствию всех переменных в построенном дереве.
+
+Основным методом мы выбираем k-means - и ключевой аргумент здесь именно устойчивость при росте выборки. K-medoids на малой выборке заметно проигрывал по силуэту (0.236 против 0.304 у k-means), потому что медоид привязан к конкретной точке данных (самый типичный центр) и на малом n может показывать не лучшие результаты. При росте n с 10343 до 20696 силуэт k-medoids подтянулся до 0.313 и сравнялся с k-means (0.312), тогда как k-means оставался стабильным с самого начала (с 0.304 до 0.312). Для предсказуемой и воспроизводимой сегментации это главное и, как мне кажется, неоспоримое преимущество  
+
+
+**Задание 4**
+
+Подготовим данные для деревьев решений. Сначала будем использовать нашу малую подвыборку bmq_sample1
+
+```r
+
+glimpse(bmq_sample1)
+round(prop.table(table(bmq_sample1$y)) * 100, 1)
+
+```
+Классы по y распределены у нас диспропорционально, как отмечалось в разделе с описательной статистикой. Но будем работать с тем, что есть. 
+Запишем в вектор все названия интервальных и категориальных переменных. Сразу же отмечу, что не буду добавлять следующие переменные default и pdays из-за космического количества пропусков. По этой же причине удалим customer_rating - из описательной статистики помним, что для той переменной каждое шествое значение - пропущенное
+
+```r
+
+num_all <- c(
+  "age",
+  "duration",
+  "campaign",
+  "previous",
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "euribor3m",
+  "nr.employed",
+  "involvement_score",
+  "account_tenure",
+  "market_sentiment",
+  "seasonal_promo_index",
+  "account_balance",
+  "campaign_email",
+  "campaign_push"
+)
+
+cat_all <- c(
+  "job",
+  "marital",
+  "education",
+  "housing",
+  "loan",
+  "contact",
+  "month",
+  "day_of_week",
+  "poutcome",
+  "primary_channel",
+  "has_opted_out",
+  "marketing_channel",
+  "was_pdays",
+  "was_customer_rating"
+)
+
+features_all <- c(num_all, cat_all)
+
+model_data <- bmq_sample1 %>%
+  select(all_of(features_all), y) %>%
+  mutate(
+    across(all_of(cat_all), as.factor),
+    y = factor(y, levels = c("no", "yes"))
+  ) %>%
+  filter(complete.cases(.))
+
+glimpse(model_data)
+
+model_data %>%
+  select(all_of(cat_all)) %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+
+```
+Категориальные - факторы, числовые - числовые. Идем дальше.
+Cоздаем теперь подвыборки train/test
+
+```r
+
+train_index <- createDataPartition(
+  model_data$y,
+  p = 0.7,
+  list = FALSE
+)
+
+train_all <- model_data[train_index, ]
+test_all  <- model_data[-train_index, ]
+
+dim(train_all)
+dim(test_all)
+
+round(prop.table(table(model_data$y)) * 100, 1)
+round(prop.table(table(train_all$y)) * 100, 1)
+round(prop.table(table(test_all$y)) * 100, 1)
+
+```
+Распределения одинаковые - одинаково плохие и дисбалансированные. Стоит в дальнейшем использовать accuracy лишь вторично.
+
+Идем дальше.
+Создаем числовую версию целевой переменной для XGBoost и CatBoost где no = 0, yes = 1. 
+
+```r
+
+y_train_num <- ifelse(train_all$y == "yes", 1, 0)
+y_test_num  <- ifelse(test_all$y == "yes", 1, 0)
+
+```
+
+Теперь подготовим данные для XGBooost - для этого преобразуем данные в матрицу
+
+```r
+
+xgb_formula <- as.formula(
+  paste("~", paste(features_all, collapse = " + "), "- 1")
+)
+
+# преобразуем трейн в матрицу 
+x_train_xgb <- model.matrix(
+  xgb_formula,
+  data = train_all
+)
+
+# преобразуем тест в матрицу 
+x_test_xgb <- model.matrix(
+  xgb_formula,
+  data = test_all
+)
+
+# создаем DMatrix для XGBoost
+dtrain <- xgb.DMatrix(
+  data = x_train_xgb,
+  label = y_train_num
+)
+
+dtest <- xgb.DMatrix(
+  data = x_test_xgb,
+  label = y_test_num
+)
+
+```
+
+Теперь подготовим данные для Catboost - укажим наши cat_features
+
+```r
+
+cat_train <- train_all %>%
+  select(all_of(features_all))
+
+cat_test <- test_all %>%
+  select(all_of(features_all))
+
+# зафиксируем список категориальных признаков для CatBoost
+cat_features_cb <- cat_all
+
+cat_features_cb
+
+```
+Теперь создаем Pool объекты
+
+```r
+
+train_pool <- catboost.load_pool(
+  data = cat_train,
+  label = y_train_num,
+)
+
+test_pool <- catboost.load_pool(
+  data = cat_test,
+  label = y_test_num,
+)
+
+```
+
+На основе кода из лекции сделаем функцию расчетов Accuracy, Precision, Recall, F1, ROC-AUC 
+
+```r
+
+calculate_metrics <- function(true_labels, pred_probs, threshold = 0.5) {
+  
+  true_factor <- factor(true_labels, levels = c("no", "yes"))
+  
+  pred_factor <- factor(
+    ifelse(pred_probs >= threshold, "yes", "no"),
+    levels = c("no", "yes")
+  )
+  
+  cm <- caret::confusionMatrix(
+    data = pred_factor,
+    reference = true_factor,
+    positive = "yes"
+  )
+  
+  roc_obj <- pROC::roc(
+    response = true_factor,
+    predictor = pred_probs,
+    levels = c("no", "yes"),
+    direction = "<",
+    quiet = TRUE
+  )
+    
+  tibble(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Precision = as.numeric(cm$byClass["Precision"]),
+    Recall = as.numeric(cm$byClass["Recall"]),
+    F1 = as.numeric(cm$byClass["F1"]),
+    ROC_AUC = as.numeric(pROC::auc(roc_obj))
+  )
+}
+
+```
+
+Запустим RF - также посмотрим на время выполнения - затраты памяти выведем в сводной таблице
+
+```r
+rf_time <- system.time({
+  rf_model <- randomForest(
+    y ~ .,
+    data = train_all,
+    ntree = 200,
+    mtry = 5,
+    importance = TRUE,
+    classwt = c(
+      "no" = 1,
+      "yes" = sum(train_all$y == "no") / sum(train_all$y == "yes")
+    )
+  )
+})
+
+# Смотрим результат обучения модели
+rf_model
+```
+RandomForest показывает низкую общую OOB-ошибку - 10%, однако матрица ошибок ожидаемо показывает сильную асимметрию качества: модель хорошо распознает доминирующий класс no, но часто пропускает клиентов с y = yes.
+
+```r
+
+# получаем вероятности целевой категории - yes 
+rf_pred <- predict(
+  rf_model,
+  newdata = test_all,
+  type = "prob"
+)[, "yes"]
+
+# считаем показатели RandomForest на тестовой выборке
+rf_metrics <- calculate_metrics(
+  true_labels = test_all$y,
+  pred_probs = rf_pred
+)
+
+rf_metrics <- rf_metrics %>%
+  mutate(Model = "RandomForest") %>%
+  select(Model, everything())
+
+rf_metrics
+```
+
+RandomForest дает высокий ROC-AUC, но низкий Recall. Модель хорошо отделяет более перспективных клиентов от менее перспективных, однако при пороге 0.5 пропускает значительную часть клиентов с положительным откликом. F1 = 0.41 подтверждает, что из-за дисбаланса классов модель плохо предсказывает yes. Посмотрим как будут себя вести деревья в дальнейшем. Более подробно сравним их после.
+
+Теперь построим CatBoost-модель
+
+```r
+
+cat_params <- list(
+  loss_function = "Logloss",
+  eval_metric = "AUC",
+  iterations = 300,
+  learning_rate = 0.05,
+  depth = 6,
+  auto_class_weights = "Balanced",
+  random_seed = 857612,
+  logging_level = "Silent"
+)
+
+cat_time <- system.time({
+  cat_model <- catboost.train(
+    learn_pool = train_pool,
+    test_pool = test_pool,
+    params = cat_params
+  )
+})
+
+cat_model
+
+```
+
+Рассчитаем показатели качества модели
+
+```r
+
+# получаем вероятности целевой категории - yes
+cat_pred <- catboost.predict(
+  model = cat_model,
+  pool = test_pool,
+  prediction_type = "Probability"
+)
+
+# считаем показатели CatBoost на тестовой выборке
+cat_metrics <- calculate_metrics(
+  true_labels = test_all$y,
+  pred_probs = cat_pred
+)
+
+cat_metrics <- cat_metrics %>%
+  mutate(Model = "CatBoost") %>%
+  select(Model, everything())
+
+cat_metrics
+
+```
+
+Интерпретируем после. Сейчас же обучим XGBoost - тоже смотрим на время
+
+```r
+
+# задаем параметры XGBoost
+xgb_params <- list(
+  objective = "binary:logistic",    
+  eval_metric = "auc",                
+  max_depth = 6,                      
+  eta = 0.1,                        
+  subsample = 0.8, # на каждом шаге берем 80% строк, это снижает переобучение
+  colsample_bytree = 0.8, # на каждом дереве берем 80% признаков, это тоже снижает переобучение
+  scale_pos_weight = sum(train_all$y == "no") / sum(train_all$y == "yes") # вес
+)
+
+xgb_time <- system.time({
+  xgb_model <- xgb.train(
+    params = xgb_params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+})
+
+xgb_model
+
+```
+Посмотрим на показатели XGBoost
+
+```r
+
+# получаем вероятности класса yes на тестовой выборке
+xgb_pred <- predict(
+  xgb_model, 
+  dtest      
+)
+
+xgb_metrics <- calculate_metrics(
+  true_labels = test_all$y, # реальные значения y на test
+  pred_probs = xgb_pred     # предсказанные вероятности yes
+)
+
+xgb_metrics <- xgb_metrics %>%
+  mutate(Model = "XGBoost") %>% 
+  select(Model, everything()) 
+
+
+xgb_metrics
+
+```
+
+Получили финальную табличку - сделаем сводную сравнительную таблицу. 
+
+```r
+
+model_comp <- bind_rows(
+  rf_metrics,
+  cat_metrics,
+  xgb_metrics
+) %>%
+  mutate(
+    across(where(is.numeric), ~ round(.x, 3))
+  )
+
+model_comp
+
+```
+
+Наиболее сбалансированной моделью является XGBoost: он показывает высокий F1 = 0.61 высокий ROC-AUC = 0.93 и приемлемый баланс между поиском клиентов с y = yes и количеством ложных срабатываний. CatBoost лучше подходит для стратегии максимального охвата, так как имеет самый высокий Recall = 0.88 и лучший ROC-AUC = 0.94. RandomForest можно рассматривать как базовую модель: несмотря на высокую Accuracy, он плохо находит положительный класс, поэтому уступает другим бустинговым моделям.
+
+
+```r
+
+# функция для расчета ROC-AUC
+get_auc <- function(true_labels, pred_probs) {
+  roc_obj <- pROC::roc(
+    response = factor(true_labels, levels = c("no", "yes")), # реальные классы
+    predictor = pred_probs,                                  # вероятности yes
+    levels = c("no", "yes"),                                 # порядок классов
+    direction = "<",                                         # yes считается положительным классом
+    quiet = TRUE                                             # отключаем лишний вывод
+  )
+  
+  as.numeric(pROC::auc(roc_obj)) # возвращаем AUC числом
+}
+
+
+# вероятности RandomForest на train
+rf_train_pred <- predict(
+  rf_model,          # обученная модель RF
+  newdata = train_all, # train-данные
+  type = "prob"      # нужны вероятности, а не классы
+)[, "yes"]
+
+# вероятности CatBoost на train
+cat_train_pred <- catboost.predict(
+  model = cat_model,      # обученная модель CatBoost
+  pool = train_pool,        # train-данные CatBoost
+  prediction_type = "Probability" # нужны вероятности
+)
+
+# вероятности XGBoost на train
+xgb_train_pred <- predict(
+  xgb_model, # обученная модель XGBoost
+  dtrain     # train-данные XGBoost
+)
+
+```
+
+Собираем train/test AUC и разрыв + время и память
+
+```r
+
+model_summary_table <- bind_rows(
+  rf_metrics %>%
+    mutate(
+      Train_AUC = get_auc(train_all$y, rf_train_pred),
+      AUC_Gap = Train_AUC - ROC_AUC,
+      Train_Time_sec = as.numeric(rf_time["elapsed"]),
+      Model_Size_MB = as.numeric(object.size(rf_model)) / 1024^2
+    ),
+  
+  cat_metrics %>%
+    mutate(
+      Train_AUC = get_auc(train_all$y, cat_train_pred),
+      AUC_Gap = Train_AUC - ROC_AUC,
+      Train_Time_sec = as.numeric(cat_time["elapsed"]),
+      Model_Size_MB = as.numeric(object.size(cat_model)) / 1024^2
+    ),
+  
+  xgb_metrics %>%
+    mutate(
+      Train_AUC = get_auc(train_all$y, xgb_train_pred),
+      AUC_Gap = Train_AUC - ROC_AUC,
+      Train_Time_sec = as.numeric(xgb_time["elapsed"]),
+      Model_Size_MB = as.numeric(object.size(xgb_model)) / 1024^2
+    )
+) %>%
+  mutate(
+    across(where(is.numeric), ~ round(.x, 3))
+  )
+
+model_summary_table
+
+```
+Разрыв между Train AUC и Test AUC у всех моделей ниже 0.1, поэтому признаков критического переобучения по этому критерию не наблюдается. RandomForest и XGBoost почти идеально разделяют классы на обучающей выборке, что может указывать на более сильную подгонку под train. Однако тестовый ROC-AUC остается высоким. CatBoost показывает наименьший разрыв между Train AUC и Test AUC, поэтому выглядит наиболее устойчивым с точки зрения обобщающей способности.
+При этом выбор итоговой модели нельзя делать только по AUC gap: нужно учитывать F1, Recall, Precision, время обучения и интерпретируемость. Поэтому XGBoost можно оставить как основную модель, если он дает лучший баланс F1/Precision/времени, а CatBoost - как более устойчивую альтернативу.
+
+По тому, что мы видим, можно сказать слеждующее - на данный момент мы рассмотрим в качестве предварительно-основной модели XGBoost. Он показывает лучший баланс качества и сложности: максимальный F1, высокий ROC-AUC, приемлемый Recall, более высокая Precision, чем у CatBoost, и минимальное время обучения. Ничего не мешает нам после дополнительной проверки изменить наше мнение.
+
+Посмотрим на топ 15 важных признаков модели
+
+```r
+
+xgb_importance_table <- xgb.importance(
+  feature_names = colnames(x_train_xgb), # названия признаков 
+  model = xgb_model 
+)
+
+xgb_importance_top15 <- xgb_importance_table %>%
+  as_tibble() %>%
+  select(Feature, Gain, Cover, Frequency) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  slice_head(n = 15)
+
+xgb_importance_top15
+
+```
+
+Наибольший вклад в модель дает duration с Gain = 0.325. Однако этот результат нужно интерпретировать осторожно, поскольку длительность контакта становится известна только после взаимодействия с клиентом, поэтому для реального предварительного скоринга этот признак может быть источником утечки данных.
+
+Если не учитывать потенциально проблемный duration, наиболее важными факторами становятся макроэкономическая ситуация (nr.employed, emp.var.rate, euribor3m), сезонно-маркетинговый фон (seasonal_promo_index, market_sentiment) и клиентские характеристики (involvement_score, account_balance, age).
+
+Далее чтобы сформировать сокращенный-набор признаков, сначала посмотрим на связи между числовыми переменными - если две переменные сильно коррелируют и при этом близки по смыслу, одну из них можно исключить.
+
+```r
+
+num_corr_data <- model_data %>%
+  select(all_of(num_all))
+
+corr_matrix <- cor(
+  num_corr_data,
+  use = "pairwise.complete.obs"
+)
+
+corrplot::corrplot(
+  corr_matrix,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.7,
+  tl.col = "black",
+  addCoef.col = "black",
+  number.cex = 0.5
+)
+
+```
+Взглянув на коррелограмму наиболее адекватным решением представляется оставить один официальный финансовый индикатор (euribor3m), а остальные макро-переменные убираем как избыточные. Также есть предположение, что duration может давать утечку данных - поэтому проверим.
+
+Создадим несколько наборов - полностью сокращенный, сокращенный по макро, сокращенный по duration. Сравним результатты позже. Выполняем сейчас все на XGBoost и CatBoost на малой выборке
+
+```r
+
+# макроблок на удаление
+remove_macro <- c(
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "nr.employed",
+  "seasonal_promo_index"
+)
+
+cat_reduced <- cat_all
+
+# минус duration
+num_no_dur <- setdiff(num_all, "duration")
+features_no_dur <- c(num_no_dur, cat_reduced)
+
+# минус макро
+num_reduced_macro <- setdiff(num_all, remove_macro)
+features_reduced_macro <- c(num_reduced_macro, cat_reduced)
+
+# минус макро И duration
+num_reduced <- setdiff(num_all, c(remove_macro, "duration"))
+
+features_reduced <- c(num_reduced, cat_reduced)
+
+```
+
+Теперь строим модели по обрезанным данным. Сначала XGB. Поскольку нам предстоит множество однотипных запусков - реализуем через функцию
+
+```r
+# обучает XGBoost
+run_xgb_set <- function(feature_set, set_label) {
+  train_s <- train_all %>% select(all_of(feature_set), y)
+  test_s  <- test_all  %>% select(all_of(feature_set), y)
+
+  f <- as.formula(paste("~", paste(feature_set, collapse = " + "), "- 1"))
+  x_train <- model.matrix(f, data = train_s)
+  x_test  <- model.matrix(f, data = test_s)
+
+  dtrain <- xgb.DMatrix(data = x_train, label = y_train_num)
+  dtest  <- xgb.DMatrix(data = x_test,  label = y_test_num)
+
+  t <- system.time({
+    m <- xgb.train(params = xgb_params, data = dtrain, nrounds = 100, verbose = 0)
+  })
+
+  pred_test  <- predict(m, dtest)
+  pred_train <- predict(m, dtrain)
+
+  calculate_metrics(true_labels = test_s$y, pred_probs = pred_test) %>%
+    mutate(
+      Model = "XGBoost",
+      Feature_Set = set_label,
+      Train_AUC = get_auc(train_s$y, pred_train),
+      Train_Time_sec = as.numeric(t["elapsed"])
+    )
+}
+
+```
+
+То же самое для CatBoost
+
+```r
+
+# обучает CatBoost
+run_cat_set <- function(feature_set, set_label) {
+  cat_train_s <- train_all %>% select(all_of(feature_set))
+  cat_test_s  <- test_all  %>% select(all_of(feature_set))
+
+  pool_train <- catboost.load_pool(data = cat_train_s, label = y_train_num)
+  pool_test  <- catboost.load_pool(data = cat_test_s,  label = y_test_num)
+
+  t <- system.time({
+    m <- catboost.train(learn_pool = pool_train, test_pool = pool_test, params = cat_params)
+  })
+
+  pred_test  <- catboost.predict(m, pool = pool_test,  prediction_type = "Probability")
+  pred_train <- catboost.predict(m, pool = pool_train, prediction_type = "Probability")
+
+  calculate_metrics(true_labels = test_all$y, pred_probs = pred_test) %>%
+    mutate(
+      Model = "CatBoost",
+      Feature_Set = set_label,
+      Train_AUC = get_auc(train_all$y, pred_train),
+      Train_Time_sec = as.numeric(t["elapsed"])
+    )
+}
+
+```
+
+Теперь общий свод
+
+```r
+
+feature_sets <- list(
+  "Full"                 = features_all,
+  "No_duration"          = features_no_dur,
+  "No_macro"             = features_reduced_macro,
+  "No_macro_no_duration" = features_reduced
+)
+
+xgb_rows <- lapply(names(feature_sets), function(nm) run_xgb_set(feature_sets[[nm]], nm))
+cat_rows <- lapply(names(feature_sets), function(nm) run_cat_set(feature_sets[[nm]], nm))
+
+four_sets_comp <- bind_rows(xgb_rows, cat_rows) %>%
+  mutate(AUC_Gap = Train_AUC - ROC_AUC) %>%
+  select(Model, Feature_Set, Accuracy, Precision, Recall, F1,
+         ROC_AUC, Train_AUC, AUC_Gap, Train_Time_sec) %>%
+  mutate(Feature_Set = factor(Feature_Set, levels = names(feature_sets))) %>%
+  arrange(Model, Feature_Set) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+four_sets_comp
+
+```
+
+Сравнение четырех наборов признаков позволяет разделить причину утечки. 
+
+Удаление макроэкономического блока практически не влияет на ROC-AUC: у CatBoost он падает с 0.938 до 0.937, у XGBoost - изменяется с 0.938 до 0.935 (то есть в пределах погрешности). А вот удаление duration роняет AUC резко: у CatBoost с 0.938 до 0.794, у XGBoost с 0.935 до 0.766. Набор «без макро и duration» дает ровно плюс минус тот же результат, что и «без duration» (0.794 и 0.762), что подтверждает: весь обвал качества вызван именно duration, а не макропоказателями. При этом Caboost после подобного "эксперимента" становится нашей новой моделью "по-умолчанию". Оптимальной по соотношению «качество/сложность/интерпретируемость» мы признаем именно ее.
+
+Таким образом, мы можем говорить, что именно длительность контакта "обваливала" качества моделей - итоговые метрики модели без duration можно показывать заказчику.
+
+Но для пущей уверенности мы используем большую подвыборку для окончательной валидизации CatBoost, поскольку на малой выборке XGBoost не справилась и на ней были видны признаки сильного переобучения. Из-за неустойчивости результатов не будем даже пытаться.
+
+В дальнейшем нам остается сделать прогон CatBoost на большей подвыборке (провести тоже подобный эксперимент), определить топ категорий-вкладчиков, построить финальную сегментацию + рекомендации.
+
+Строим!
+
+Дубль для большой выборки 
+  
+```r
+
+model_data2 <- bmq_sample2 %>%
+  select(all_of(features_all), y) %>%
+  mutate(
+    across(all_of(cat_all), as.factor),
+    y = factor(y, levels = c("no", "yes"))
+  ) %>%
+  filter(complete.cases(.))
+
+dim(model_data2)
+
+train_index2 <- createDataPartition(model_data2$y, 
+                                    p = 0.7, 
+                                    list = FALSE)
+
+train_all2 <- model_data2[train_index2, ]
+test_all2  <- model_data2[-train_index2, ]
+
+y_train_num2 <- ifelse(train_all2$y == "yes", 1, 0)
+y_test_num2  <- ifelse(test_all2$y == "yes", 1, 0)
+
+dim(train_all2)
+dim(test_all2)
+round(prop.table(table(test_all2$y)) * 100, 1)
+round(prop.table(table(train_all2$y)) * 100, 1)
+round(prop.table(table(test_all2$y)) * 100, 1)
+
+```
+Распределения в норме. По наполненности тоже все ок.
+
+Теперь продублируем нашу функцию - категории те же, но теперь мы используем большую выборку
+
+```r
+
+run_cat_set2 <- function(feature_set, set_label) {
+  cat_train_s <- train_all2 %>% select(all_of(feature_set))
+  cat_test_s  <- test_all2  %>% select(all_of(feature_set))
+
+  pool_train <- catboost.load_pool(data = cat_train_s, label = y_train_num2)
+  pool_test  <- catboost.load_pool(data = cat_test_s,  label = y_test_num2)
+
+  t <- system.time({
+    m <- catboost.train(learn_pool = pool_train, test_pool = pool_test, params = cat_params)
+  })
+
+  pred_test  <- catboost.predict(m, pool = pool_test,  prediction_type = "Probability")
+  pred_train <- catboost.predict(m, pool = pool_train, prediction_type = "Probability")
+
+  calculate_metrics(true_labels = test_all2$y, pred_probs = pred_test) %>%
+    mutate(
+      Model = "CatBoost",
+      Feature_Set = set_label,
+      Train_AUC = get_auc(train_all2$y, pred_train),
+      Train_Time_sec = as.numeric(t["elapsed"])
+    )
+}
+```
+
+Теперь прогоним по нашим 4-ем спискам переменных
+
+```r
+
+cat_rows2 <- lapply(names(feature_sets), function(nm) run_cat_set2(feature_sets[[nm]], nm))
+
+four_sets_comp2 <- bind_rows(cat_rows2) %>%
+  mutate(AUC_Gap = Train_AUC - ROC_AUC) %>%
+  select(Model, Feature_Set, Accuracy, Precision, Recall, F1,
+         ROC_AUC, Train_AUC, AUC_Gap, Train_Time_sec) %>%
+  mutate(Feature_Set = factor(Feature_Set, levels = names(feature_sets))) %>%
+  arrange(Feature_Set) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+four_sets_comp2
+
+```
+
+
+```r
+
+four_sets_both_cat <- bind_rows(
+  four_sets_comp  %>% filter(Model == "CatBoost") %>% mutate(Sample = "n = 11111"),
+  four_sets_comp2                                 %>% mutate(Sample = "n = 22222")
+) %>%
+  select(Sample, everything()) %>%
+  arrange(Feature_Set, Sample)
+
+four_sets_both_cat
+
+```
+Резюмируя - по набору признаков для модели CATboost вывод воспроизводится на обеих выборках. Удаление макроблока почти не влияет площадь ROC-AUC: 0.938 против 0.937 на малой и 0.953 против 0.952 на большой. При этом именно duration роняет AUC резко: до 0.794 и 0.797 на малой и большой соответственно. Набор без макро и duration дает тот же результат, что и набор без одного только duration (0.794 на обеих выборках). Это подтверждает, что качество полной модели держится на утечке duration, а не на макропоказателях, -и этот вывод устойчив при удвоении выборки.
+По объему данных AUC при росте n с 11111 до 22222 не ухудшается, а слегка растет или остается стабильным - динамика не является сильно заметной - возможно, это обусловленно более высокой устойчивостью (и улучшенной работе с категориальными переменными) модели.
+Время обучения растет от объема объему, но не ровно в два раза, а разрыв Train/Test становится кратно ниже. 
+
+
+Теперь финальное - посмотрим на изменение импактов. Ожидаем приятной картины для сокращенного набора переменных.
+
+```r
+
+# вывод для CatBoost с полным набором фичей
+
+cat_train2 <- train_all2 %>% select(all_of(features_all))
+cat_test2  <- test_all2  %>% select(all_of(features_all))
+
+train_pool2 <- catboost.load_pool(data = cat_train2, label = y_train_num2)
+test_pool2  <- catboost.load_pool(data = cat_test2,  label = y_test_num2)
+
+cat_model2 <- catboost.train(
+  learn_pool = train_pool2,
+  test_pool  = test_pool2,
+  params = cat_params
+)
+
+# вызов сокращенной модели
+cat_train_reduced2 <- train_all2 %>% select(all_of(features_reduced))
+cat_test_reduced2  <- test_all2  %>% select(all_of(features_reduced))
+
+train_pool_reduced2 <- catboost.load_pool(data = cat_train_reduced2, label = y_train_num2)
+test_pool_reduced2  <- catboost.load_pool(data = cat_test_reduced2,  label = y_test_num2)
+
+cat_time_reduced2 <- system.time({
+  cat_model_reduced2 <- catboost.train(
+    learn_pool = train_pool_reduced2,
+    test_pool  = test_pool_reduced2,
+    params = cat_params
+  )
+})
+
+cat_importance_comp2 <- bind_rows(
+  tibble(
+    Feature_Set = "Full",
+    Feature = features_all,
+    Importance = catboost.get_feature_importance(
+      model = cat_model2,
+      pool = train_pool2,
+      type = "FeatureImportance"
+    )
+  ),
+  tibble(
+    Feature_Set = "Reduced",
+    Feature = features_reduced,
+    Importance = catboost.get_feature_importance(
+      model = cat_model_reduced2,
+      pool = train_pool_reduced2,
+      type = "FeatureImportance"
+    )
+  )
+) %>%
+  group_by(Feature_Set) %>%
+  arrange(desc(Importance), .by_group = TRUE) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  mutate(Importance = round(Importance, 3))
+
+cat_importance_comp2
+
+
+```
+
+Как и ожидали, в полной модели доминирует duration (43.4) - это в свою очередь лишь подтверждает наличие утечки; за ним идут макропоказатели (nr.employed, euribor3m, emp.var.rate). После удаления duration и макроблока на первый план в reduced выходят содержательные предикторы: euribor3m, month, poutcome, job, contact и каналы коммуникации. Ситцация стала несколько лучше
+
+
+Теперь посмотрим на профили
+
+```r
+
+cat_pred_reduced2 <- catboost.predict(
+  model = cat_model_reduced2,
+  pool = test_pool_reduced2,
+  prediction_type = "Probability"
+)
+
+test_scored_cat_reduced2 <- test_all2 %>%
+  mutate(
+    pred_prob = cat_pred_reduced2,
+    score_quintile = ntile(pred_prob, 5),
+    score_segment = case_when(
+      score_quintile == 5 ~ "Высокий потенциал",
+      score_quintile %in% c(3, 4) ~ "Средний потенциал",
+      TRUE ~ "Низкий потенциал"
+    )
+  )
+
+score_summary_cat_reduced2 <- test_scored_cat_reduced2 %>%
+  group_by(score_segment) %>%
+  summarise(
+    n = n(),
+    avg_pred_prob = mean(pred_prob),
+    real_yes_share = mean(y == "yes"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    score_segment = factor(score_segment,
+      levels = c("Высокий потенциал", "Средний потенциал", "Низкий потенциал")),
+    across(where(is.numeric), ~ round(.x, 3))
+  ) %>%
+  arrange(score_segment)
+
+score_summary_cat_reduced2
+
+segment_profile_cat_reduced2 <- test_scored_cat_reduced2 %>%
+  group_by(score_segment) %>%
+  summarise(
+    n = n(),
+    real_yes_share = mean(y == "yes"),
+    avg_pred_prob = mean(pred_prob),
+    avg_account_balance = mean(account_balance, na.rm = TRUE),
+    avg_euribor3m = mean(euribor3m, na.rm = TRUE),
+    avg_previous = mean(previous, na.rm = TRUE),
+    mode_marketing_channel = get_mode(marketing_channel),
+    mode_poutcome = get_mode(poutcome),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    score_segment = factor(score_segment,
+      levels = c("Высокий потенциал", "Средний потенциал", "Низкий потенциал")),
+    across(where(is.numeric), ~ round(.x, 3))
+  ) %>%
+  arrange(score_segment)
+
+segment_profile_cat_reduced2
+
+```
+
+Фактическая доля отклика монотонно падает от высокого сегмента к низкому -35% / 6% / 4%, при средней по тесту около 11%. В «Высоком потенциале» отклик втрое выше среднего, в «Низком» - втрое ниже. Выглядит достаточно симпатично
+
+
+Финально построим сводную таблицу, основываясь в том числе на результатах кластерного анализа
+
+```r
+target_recommendations_cat_reduced2 <- tibble::tribble(
+  ~Segment, ~Cluster_link, ~Channel, ~Offer, ~Expected_Effect,
+
+  "Высокий потенциал",
+  "реактивированный",
+  "mobile_app / push",
+  "акционные предложения, скидки, персональные промокоды",
+  "самая лояльная аудитория - в первую очередь бюджеты должны направляться на нее",
+
+  "Средний потенциал",
+  "цифровые кластеры без истории + push-кластер",
+  "email / push / mobile_app",
+  "альтернативные способы вовлечения - упор на частоту контакта",
+  "потенциально лояльная аудитория - резонность трат будет определена после выявления стоимости привлечения",
+
+  "Низкий потенциал",
+  "офлайн-кластер",
+  "branch / direct_mail / phone",
+  "минимальные награды",
+  "экономия бюджета на данной группе лиц"
+)
+
+target_recommendations_cat_reduced2
+```
+
+Теперь таблица удаленных признаков:
+
+```r
+
+removed_features_table <- tibble::tribble(
+  ~Feature, ~Stage, ~Reason,
+
+  "default",
+  "не включен",
+  "около 21% пропусков, корректно заполнить нельзя",
+
+  "pdays",
+  "не включен",
+  "999 = контакта не было; заменен индикатором was_pdays",
+
+  "customer_rating",
+  "не включен",
+  "0 = не оценивал; заменен индикатором was_customer_rating",
+
+  "duration",
+  "сокращенный набор",
+  "утечка",
+
+  "emp.var.rate",
+  "сокращенный набор",
+  "дублирует макросигнал",
+
+  "cons.price.idx",
+  "сокращенный набор",
+  "дублирует макросигнал",
+
+  "cons.conf.idx",
+  "сокращенный набор",
+  "дублирует макросигнал",
+
+  "nr.employed",
+  "сокращенный набор",
+  "дублирует макросигнал",
+
+  "seasonal_promo_index",
+  "сокращенный набор",
+  "по глоссарию зависит от месяца, но не от y - шумовой признак"
+)
+
+removed_features_table
+```
+
+Финальные выводы:
+
+По результатам моделей и скоринговой сегментации основным приоритетом таргетинга является сегмент «Высокий потенциал». Фактическая доля отклика в нём составляет 35% -втрое выше средней по выборке, и он сопоставляется с наиболее конверсионным кластером (реактивированным). Это подтверждается профилем: у сегмента самая длинная история контактов (avg_previous = 0.51, выше всех) и доминирует цифровой канал mobile_app. На него следует направлять основные ресурсы -цифровые каналы mobile_app и push с персональным предложением, скидками и промокодами.
+
+Сегмент «Средний потенциал» (отклик 6%) соответствует цифровым кластерам без выраженной прошлой истории: канал тот же mobile_app, но avg_previous падает до 0.15 -клиенты почти не взаимодействовали с банком ранее. Для него подходит неагрессивное вовлечение через email/push/mobile_app с упором на частоту контакта, при контроле стоимости привлечения, поскольку это потенциально лояльная, но на данный момент незаинтересованная аудитория.
+
+Сегмент «Низкий потенциал» (отклик 3.8%) отождествляется с офлайн-кластером: доминирующий канал -branch, истории контактов практически нет (avg_previous = 0.06), а макрофон наименее благоприятный (euribor3m = 4.82 против 1.11 у высокого сегмента). Этот сегмент не должен быть приоритетом активной кампании: для него используются дешёвые офлайн-каналы (branch, direct_mail, phone) точечно, с минимальными предложениями, ради экономии бюджета.
+
+В качестве основной модели для осторожного предварительного скоринга можно использовать CatBoost с урезанным набором переменных: там не используютс “плохие” переменные, лучше интерпретируется и на большей подвыборке показывает улучшение Recall, F1 и снижение AUC Gap. Модели на полном наборе переменных дают более высокое качество, но их результаты нужно интерпретировать осторожно из-за сильной роли duration и макроэкономических показателей. Причем было выявлено, что именно duration, а не какая либо другая переменная из макроблока была причиной просадки качества модели. Тем не менее, еще раз уточним - эта просадка была необходимой, чтобы избежать некачественных результатов. На данный момент достигнут баланс между интерпретируемостью, качеством модели и набором перемнных.
+
+```r
+
+```
+
